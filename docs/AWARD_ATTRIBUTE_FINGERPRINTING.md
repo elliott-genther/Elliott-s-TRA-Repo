@@ -1,0 +1,816 @@
+# Award Attribute Fingerprinting: A Robust Claim-Type Identification & Letter Routing System
+
+## Table of Contents
+
+- [The Problem Today](#the-problem-today)
+- [The Award Attribute Fingerprint Model](#the-award-attribute-fingerprint-model)
+  - [Core Concept](#core-concept)
+  - [Fingerprint Dimensions](#fingerprint-dimensions)
+  - [Mapping Award Types to Fingerprint Dimensions](#mapping-award-types-to-fingerprint-dimensions)
+- [Proposed Implementation](#proposed-implementation)
+  - [1. The Fingerprint Enum & Value Object](#1-the-fingerprint-enum--value-object)
+  - [2. The Fingerprint Extractor](#2-the-fingerprint-extractor--builds-fingerprints-from-existing-data)
+  - [3. The Letter Route Resolver](#3-the-letter-route-resolver--maps-fingerprints-to-letter-types)
+  - [4. The Complete Fingerprint-to-Letter Mapping Table](#4-the-complete-fingerprint-to-letter-mapping-table)
+- [How This Replaces Existing Logic](#how-this-replaces-existing-logic)
+- [Key Design Decisions & Domain Rationale](#key-design-decisions--domain-rationale)
+- [Next Steps](#next-steps)
+
+---
+
+## The Problem Today
+
+The current system has **tightly coupled, scattered logic** for determining letter types. Key observations from the `vbms-awards` and `vbms-correspondence` repositories:
+
+### 1. `RatingInformationDataConsumer.getLetterType()`
+
+Uses a simple award type check (CPL/CPDS/CPDC/CPDP → PFS ADL, else → RADL):
+
+```java
+// RatingInformationDataConsumer.java
+LetterTypeEnum getLetterType(String awardType) {
+    boolean isPfsAdlEnabled = env.isPfsAdlEnabled();
+    if (isPfsAdlEnabled && (
+        AwardType.cplCode.equals(awardType)  ||
+            AwardType.cpdsCode.equals(awardType) ||
+            AwardType.cpdcCode.equals(awardType) ||
+            AwardType.cpdpCode.equals(awardType))
+    ) {
+        return LetterTypeEnum.PFS_AUTOMATED_DECISION_LETTER;
+    }
+    return LetterTypeEnum.AUTOMATED_DECISION_LETTER;
+}
+```
+
+### 2. `AwardsDataConsumer.validateClaimTypes()`
+
+Uses EP code validation and out-of-scope lists with special bypass logic for PFS ADL claims:
+
+```java
+// AwardsDataConsumer.java
+if (!request.isFeeAllocationNoticeLetter() && !request.isNrhlrDecision() && !request.isPfsAdlLetter()) {
+    validateClaimTypes(award.getHAwardEvent(), award.getAwardType());
+}
+```
+
+### 3. `displayaward.js`
+
+Makes front-end routing decisions based on feature flags, eligibility booleans, and award type strings:
+
+```javascript
+// displayaward.js
+if (!isPfsAdlEnabled || (!isEligibleForPfsAdl && awardType == 'CPL') || awardType == 'BUR') {
+    displayCurrentAndProposedFormSave(awardsClaimsSize, successPage);
+    return;
+}
+```
+
+> **Summary:** This is fragile, hard to extend, and distributes routing decisions across Java services, JSPs, and JavaScript.
+
+---
+
+## The Award Attribute Fingerprint Model
+
+### Core Concept
+
+Every claim processed through the Awards system carries **inherent attributes** — properties that exist because of *what the claim is*, not because of any adjudicative decision. These attributes form a **composite fingerprint** that deterministically maps to a letter generation pipeline (PFS ADL vs. Comp RADL).
+
+### Fingerprint Dimensions
+
+Based on analysis of the codebase, there are **six fingerprint dimensions** derived from actual data structures in the system:
+
+| #  | Dimension              | Source in Code                                      | Values                                                                 |
+|----|------------------------|-----------------------------------------------------|------------------------------------------------------------------------|
+| 1  | **Program Type**       | `AwardType` codes                                   | `PENSION`, `COMPENSATION`, `DIC`, `BURIAL`, `ACCRUED`, `SPECIAL`       |
+| 2  | **Claimant Type**      | `AwardType` code suffix + `payeeType`               | `VETERAN`, `SPOUSE`, `CHILD`, `PARENT`                                 |
+| 3  | **Benefit Category**   | `benefitTypeCd` (CPL/CPD) + Award Line Types        | `RECURRING`, `ONE_TIME`, `ACCRUED`                                     |
+| 4  | **Service Connection** | Rating profile presence + Basic Eligibility Decisions | `SERVICE_CONNECTED`, `NON_SERVICE_CONNECTED`, `MIXED`                 |
+| 5  | **Fiduciary Involvement** | Payee type code != "00"                          | `FIDUCIARY`, `NO_FIDUCIARY`                                            |
+| 6  | **Claim Lane**         | EP code prefix (3-digit numeric)                    | `ORIGINAL`, `SUPPLEMENTAL`, `HLR`, `BVA`, `DEPENDENCY`, `SPECIAL`     |
+
+### Mapping Award Types to Fingerprint Dimensions
+
+The actual `AwardType` constants from the codebase:
+
+```java
+// AwardType.java
+public static final String cplCode = "CPL";       // Compensation/Pension Live
+public static final String mohCode = "MOH";       // Medal of Honor
+public static final String burialCode = "BUR";    // Burial
+public static final String accruedCode = "ACC";   // Accrued
+public static final String cpdsCode = "CPDS";     // CPD Spouse (Death)
+public static final String cpdcCode = "CPDC";     // CPD Child (Death)
+public static final String cpdpCode = "CPDP";     // CPD Parent (Death)
+public static final String caCode = "CA";         // Clothing Allowance
+public static final String _306Veteran = "306V";  // Section 306 Veteran
+public static final String oldLawVeteran = "OLV"; // Old Law Veteran
+public static final String _306Spouse = "306S";   // Section 306 Spouse
+public static final String _306Child = "306C";    // Section 306 Child
+public static final String deathCompSpouse = "DCS"; // Death Comp Spouse
+public static final String deathCompChild = "DCC";  // Death Comp Child
+public static final String deathCompParent = "DCP"; // Death Comp Parent
+public static final String _1312ASpouse = "1312S";  // 1312A Spouse
+public static final String _1312AChild = "1312C";   // 1312A Child
+public static final String _1312AParent = "1312P";  // 1312A Parent
+```
+
+---
+
+## Proposed Implementation
+
+### 1. The Fingerprint Enum & Value Object
+
+```java
+package gov.va.vba.award.fingerprint;
+
+import java.util.Objects;
+
+/**
+ * Immutable value object representing the composite fingerprint of a claim.
+ * Built from inherent claim attributes — NOT adjudicative decisions.
+ */
+public final class ClaimFingerprint {
+
+    // ─── Dimension Enums ───
+
+    public enum ProgramType {
+        PENSION,          // Veterans Pension (IP, IDP, OLP, 306P, etc.)
+        COMPENSATION,     // Service-connected disability compensation
+        DIC,              // Dependency & Indemnity Compensation
+        BURIAL,           // Burial benefits
+        ACCRUED,          // Accrued benefits
+        SPECIAL           // MOH, Clothing Allowance, CH18, etc.
+    }
+
+    public enum ClaimantType {
+        VETERAN,
+        SPOUSE,
+        CHILD,
+        PARENT
+    }
+
+    public enum BenefitCategory {
+        RECURRING,        // Monthly ongoing payments
+        ONE_TIME,         // Lump-sum (burial, accrued)
+        ACCRUED           // Benefits accrued prior to death
+    }
+
+    public enum ServiceConnection {
+        SERVICE_CONNECTED,
+        NON_SERVICE_CONNECTED,
+        MIXED              // CPL awards can contain both SC and NSC components
+    }
+
+    public enum FiduciaryStatus {
+        FIDUCIARY,
+        NO_FIDUCIARY
+    }
+
+    public enum ClaimLane {
+        ORIGINAL,          // EP 010, 110, 020, 120, etc.
+        SUPPLEMENTAL,      // EP 040 series
+        HLR,               // EP 030 series (Higher Level Review)
+        BVA,               // Board of Veterans' Appeals remands
+        DEPENDENCY,        // EP 130, 600 series
+        SPECIAL            // COLA, running awards, etc.
+    }
+
+    // ─── Fields ───
+
+    private final ProgramType programType;
+    private final ClaimantType claimantType;
+    private final BenefitCategory benefitCategory;
+    private final ServiceConnection serviceConnection;
+    private final FiduciaryStatus fiduciaryStatus;
+    private final ClaimLane claimLane;
+
+    private ClaimFingerprint(Builder builder) {
+        this.programType = Objects.requireNonNull(builder.programType, "programType is required");
+        this.claimantType = Objects.requireNonNull(builder.claimantType, "claimantType is required");
+        this.benefitCategory = Objects.requireNonNull(builder.benefitCategory, "benefitCategory is required");
+        this.serviceConnection = Objects.requireNonNull(builder.serviceConnection, "serviceConnection is required");
+        this.fiduciaryStatus = Objects.requireNonNull(builder.fiduciaryStatus, "fiduciaryStatus is required");
+        this.claimLane = Objects.requireNonNull(builder.claimLane, "claimLane is required");
+    }
+
+    // ─── Getters ───
+
+    public ProgramType getProgramType() { return programType; }
+    public ClaimantType getClaimantType() { return claimantType; }
+    public BenefitCategory getBenefitCategory() { return benefitCategory; }
+    public ServiceConnection getServiceConnection() { return serviceConnection; }
+    public FiduciaryStatus getFiduciaryStatus() { return fiduciaryStatus; }
+    public ClaimLane getClaimLane() { return claimLane; }
+
+    // ─── Identity ───
+
+    /**
+     * Returns a canonical string representation, e.g.:
+     * "PENSION:VETERAN:RECURRING:NON_SERVICE_CONNECTED:NO_FIDUCIARY:ORIGINAL"
+     */
+    public String toCanonicalKey() {
+        return String.join(":",
+            programType.name(),
+            claimantType.name(),
+            benefitCategory.name(),
+            serviceConnection.name(),
+            fiduciaryStatus.name(),
+            claimLane.name()
+        );
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof ClaimFingerprint)) return false;
+        ClaimFingerprint that = (ClaimFingerprint) o;
+        return programType == that.programType
+            && claimantType == that.claimantType
+            && benefitCategory == that.benefitCategory
+            && serviceConnection == that.serviceConnection
+            && fiduciaryStatus == that.fiduciaryStatus
+            && claimLane == that.claimLane;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(programType, claimantType, benefitCategory,
+                           serviceConnection, fiduciaryStatus, claimLane);
+    }
+
+    @Override
+    public String toString() {
+        return "ClaimFingerprint[" + toCanonicalKey() + "]";
+    }
+
+    // ─── Builder ───
+
+    public static Builder builder() { return new Builder(); }
+
+    public static class Builder {
+        private ProgramType programType;
+        private ClaimantType claimantType;
+        private BenefitCategory benefitCategory;
+        private ServiceConnection serviceConnection;
+        private FiduciaryStatus fiduciaryStatus;
+        private ClaimLane claimLane;
+
+        public Builder programType(ProgramType val)             { this.programType = val; return this; }
+        public Builder claimantType(ClaimantType val)           { this.claimantType = val; return this; }
+        public Builder benefitCategory(BenefitCategory val)     { this.benefitCategory = val; return this; }
+        public Builder serviceConnection(ServiceConnection val) { this.serviceConnection = val; return this; }
+        public Builder fiduciaryStatus(FiduciaryStatus val)     { this.fiduciaryStatus = val; return this; }
+        public Builder claimLane(ClaimLane val)                  { this.claimLane = val; return this; }
+
+        public ClaimFingerprint build() { return new ClaimFingerprint(this); }
+    }
+}
+```
+
+---
+
+### 2. The Fingerprint Extractor — Builds Fingerprints from Existing Data
+
+This is the critical piece that reads from the **existing data structures** in the Awards system and produces a `ClaimFingerprint`.
+
+```java
+package gov.va.vba.award.fingerprint;
+
+import gov.va.vba.award.model.AwardType;
+import gov.va.vba.award.fingerprint.ClaimFingerprint.*;
+import org.apache.commons.lang.StringUtils;
+import org.springframework.stereotype.Component;
+
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+
+/**
+ * Extracts a ClaimFingerprint from the inherent attributes of a claim.
+ * This class centralizes all the "what kind of claim is this?" logic that
+ * is currently scattered across the codebase.
+ */
+@Component
+public class ClaimFingerprintExtractor {
+
+    // ═══════════════════════════════════════════════════════════════
+    // PENSION Award Types (PFS territory)
+    // These are non-service-connected, needs-based benefits
+    // administered by Pension & Fiduciary Services.
+    //
+    // Award Line Types: IP (Improved Pension), IDP (Improved Death
+    // Pension), OLP (Old Law Pension), 306P (Section 306 Pension),
+    // 306DP (Section 306 Death Pension)
+    // ═══════════════════════════════════════════════════════════════
+
+    /** Live veteran pension award types */
+    private static final Set<String> PENSION_VETERAN_TYPES = new HashSet<>(Arrays.asList(
+        AwardType.cplCode      // CPL — when benefitType is "CP" with pension award lines (IP, OLP, 306P)
+    ));
+
+    /** Section 306 and Old Law pension types — inherently pension, always PFS */
+    private static final Set<String> PENSION_LEGACY_VETERAN_TYPES = new HashSet<>(Arrays.asList(
+        AwardType._306Veteran,   // 306V
+        AwardType.oldLawVeteran  // OLV
+    ));
+
+    /** Death pension types — surviving dependents of non-SC veterans */
+    private static final Set<String> DEATH_PENSION_SPOUSE_TYPES = new HashSet<>(Arrays.asList(
+        AwardType.cpdsCode,      // CPDS — CPD Spouse (DIC/Death Pension Spouse)
+        AwardType._306Spouse,    // 306S
+        AwardType.oldLawSpouse   // OLS
+    ));
+
+    private static final Set<String> DEATH_PENSION_CHILD_TYPES = new HashSet<>(Arrays.asList(
+        AwardType.cpdcCode,      // CPDC — CPD Child
+        AwardType._306Child,     // 306C
+        AwardType.oldLawChild    // OLC
+    ));
+
+    private static final Set<String> DEATH_PENSION_PARENT_TYPES = new HashSet<>(Arrays.asList(
+        AwardType.cpdpCode       // CPDP — CPD Parent
+    ));
+
+    // ═══════════════════════════════════════════════════════════════
+    // COMPENSATION Award Types (Comp Services / RADL territory)
+    // ═══════════════════════════════════════════════════════════════
+
+    /** DIC types — service-connected death benefits (Comp Service) */
+    private static final Set<String> DIC_SPOUSE_TYPES = new HashSet<>(Arrays.asList(
+        AwardType.deathCompSpouse,  // DCS
+        AwardType._1312ASpouse      // 1312S
+    ));
+
+    private static final Set<String> DIC_CHILD_TYPES = new HashSet<>(Arrays.asList(
+        AwardType.deathCompChild,   // DCC
+        AwardType._1312AChild       // 1312C
+    ));
+
+    private static final Set<String> DIC_PARENT_TYPES = new HashSet<>(Arrays.asList(
+        AwardType.deathCompParent,  // DCP
+        AwardType._1312AParent      // 1312P
+    ));
+
+    // ═══════════════════════════════════════════════════════════════
+    // EP Code Classification
+    // ═══════════════════════════════════════════════════════════════
+
+    private static final Set<String> HLR_EP_PREFIXES = new HashSet<>(Arrays.asList("030"));
+    private static final Set<String> SUPPLEMENTAL_EP_PREFIXES = new HashSet<>(Arrays.asList("040", "930"));
+    private static final Set<String> ORIGINAL_COMP_EP_PREFIXES = new HashSet<>(Arrays.asList(
+        "010", "110", "020", "120"
+    ));
+    private static final Set<String> PENSION_EP_PREFIXES = new HashSet<>(Arrays.asList(
+        "150", "180"
+    ));
+    private static final Set<String> DEPENDENCY_EP_PREFIXES = new HashSet<>(Arrays.asList(
+        "130", "600"
+    ));
+
+    // Pension award line type codes (from AccruedDecisionsController)
+    private static final Set<String> PENSION_AWARD_LINE_TYPES = new HashSet<>(Arrays.asList(
+        "IP", "IDP", "OLDP", "OLP", "306P", "306DP", "1312A"
+    ));
+
+    // ═══════════════════════════════════════════════════════════════
+    // EXTRACTION
+    // ═══════════════════════════════════════════════════════════════
+
+    /**
+     * Builds a ClaimFingerprint from the attributes inherent to the claim.
+     *
+     * @param awardType       The AwardType code (CPL, CPDS, BUR, etc.)
+     * @param benefitTypeCd   The benefit type code (CP, CPL, CPD, etc.)
+     * @param endProductType  The full EP claim type string (e.g., "110LCOMP")
+     * @param payeeTypeCode   The payee type code ("00" = veteran, others = fiduciary)
+     * @param awardLineTypes  The set of award line type codes on this award (IP, DC, etc.)
+     * @param hasRatingProfile Whether a rating profile exists for this claim
+     * @return A fully-constructed ClaimFingerprint
+     */
+    public ClaimFingerprint extract(
+            String awardType,
+            String benefitTypeCd,
+            String endProductType,
+            String payeeTypeCode,
+            Set<String> awardLineTypes,
+            boolean hasRatingProfile) {
+
+        return ClaimFingerprint.builder()
+            .programType(resolveProgramType(awardType, benefitTypeCd, endProductType, awardLineTypes))
+            .claimantType(resolveClaimantType(awardType))
+            .benefitCategory(resolveBenefitCategory(awardType, awardLineTypes))
+            .serviceConnection(resolveServiceConnection(awardType, awardLineTypes, hasRatingProfile))
+            .fiduciaryStatus(resolveFiduciaryStatus(payeeTypeCode))
+            .claimLane(resolveClaimLane(endProductType))
+            .build();
+    }
+
+    // ─── Dimension Resolvers ───
+
+    private ProgramType resolveProgramType(
+            String awardType, String benefitTypeCd,
+            String endProductType, Set<String> awardLineTypes) {
+
+        // Explicit non-ambiguous types first
+        if (AwardType.burialCode.equals(awardType)) return ProgramType.BURIAL;
+        if (AwardType.accruedCode.equals(awardType)) return ProgramType.ACCRUED;
+        if (AwardType.mohCode.equals(awardType)) return ProgramType.SPECIAL;
+        if (AwardType.caCode.equals(awardType)) return ProgramType.SPECIAL;
+        if (AwardType.ch18SpinaBifida.equals(awardType)
+            || AwardType.ch18BirthDefects.equals(awardType)) {
+            return ProgramType.SPECIAL;
+        }
+
+        // Legacy pension types — always PFS
+        if (PENSION_LEGACY_VETERAN_TYPES.contains(awardType)) return ProgramType.PENSION;
+        if (DEATH_PENSION_SPOUSE_TYPES.contains(awardType)
+            && containsPensionAwardLines(awardLineTypes)) {
+            return ProgramType.PENSION;
+        }
+        if (DEATH_PENSION_CHILD_TYPES.contains(awardType)
+            && containsPensionAwardLines(awardLineTypes)) {
+            return ProgramType.PENSION;
+        }
+
+        // DIC types — always Compensation Service
+        if (DIC_SPOUSE_TYPES.contains(awardType)) return ProgramType.DIC;
+        if (DIC_CHILD_TYPES.contains(awardType)) return ProgramType.DIC;
+        if (DIC_PARENT_TYPES.contains(awardType)) return ProgramType.DIC;
+
+        // CPL — the ambiguous one. Resolve via EP code and award lines.
+        if (AwardType.cplCode.equals(awardType)) {
+            String epPrefix = extractEpPrefix(endProductType);
+            if (PENSION_EP_PREFIXES.contains(epPrefix)) return ProgramType.PENSION;
+            if (containsOnlyPensionAwardLines(awardLineTypes)) return ProgramType.PENSION;
+            return ProgramType.COMPENSATION;
+        }
+
+        // CPDS/CPDC/CPDP — Death types
+        if (AwardType.cpdsCode.equals(awardType)
+            || AwardType.cpdcCode.equals(awardType)
+            || AwardType.cpdpCode.equals(awardType)) {
+            if (awardLineTypes != null
+                && (awardLineTypes.contains("DIC") || awardLineTypes.contains("DICR")
+                    || awardLineTypes.contains("DICP") || awardLineTypes.contains("DC"))) {
+                return ProgramType.DIC;
+            }
+            if (containsPensionAwardLines(awardLineTypes)) {
+                return ProgramType.PENSION;
+            }
+            return ProgramType.DIC;
+        }
+
+        return ProgramType.COMPENSATION;
+    }
+
+    private ClaimantType resolveClaimantType(String awardType) {
+        if (Arrays.asList(AwardType.cpdsCode, AwardType._306Spouse, AwardType.oldLawSpouse,
+                AwardType.deathCompSpouse, AwardType._1312ASpouse, AwardType.repsCode)
+                .contains(awardType)) {
+            return ClaimantType.SPOUSE;
+        }
+        if (Arrays.asList(AwardType.cpdcCode, AwardType._306Child, AwardType.oldLawChild,
+                AwardType.deathCompChild, AwardType._1312AChild)
+                .contains(awardType)) {
+            return ClaimantType.CHILD;
+        }
+        if (Arrays.asList(AwardType.cpdpCode, AwardType.deathCompParent, AwardType._1312AParent)
+                .contains(awardType)) {
+            return ClaimantType.PARENT;
+        }
+        return ClaimantType.VETERAN;
+    }
+
+    private BenefitCategory resolveBenefitCategory(String awardType, Set<String> awardLineTypes) {
+        if (AwardType.accruedCode.equals(awardType)) return BenefitCategory.ACCRUED;
+        if (AwardType.burialCode.equals(awardType)) return BenefitCategory.ONE_TIME;
+        return BenefitCategory.RECURRING;
+    }
+
+    private ServiceConnection resolveServiceConnection(
+            String awardType, Set<String> awardLineTypes, boolean hasRatingProfile) {
+
+        if (PENSION_LEGACY_VETERAN_TYPES.contains(awardType))
+            return ServiceConnection.NON_SERVICE_CONNECTED;
+        if (DIC_SPOUSE_TYPES.contains(awardType) || DIC_CHILD_TYPES.contains(awardType)
+            || DIC_PARENT_TYPES.contains(awardType)) {
+            return ServiceConnection.SERVICE_CONNECTED;
+        }
+        if (AwardType.cplCode.equals(awardType)) {
+            boolean hasPensionLines = containsPensionAwardLines(awardLineTypes);
+            boolean hasCompLines = awardLineTypes != null && awardLineTypes.stream()
+                .anyMatch(lt -> !PENSION_AWARD_LINE_TYPES.contains(lt));
+            if (hasPensionLines && hasCompLines) return ServiceConnection.MIXED;
+            if (hasPensionLines) return ServiceConnection.NON_SERVICE_CONNECTED;
+            return ServiceConnection.SERVICE_CONNECTED;
+        }
+        if (hasRatingProfile) return ServiceConnection.SERVICE_CONNECTED;
+        return ServiceConnection.NON_SERVICE_CONNECTED;
+    }
+
+    private FiduciaryStatus resolveFiduciaryStatus(String payeeTypeCode) {
+        if (StringUtils.isBlank(payeeTypeCode) || "00".equals(payeeTypeCode)) {
+            return FiduciaryStatus.NO_FIDUCIARY;
+        }
+        return FiduciaryStatus.FIDUCIARY;
+    }
+
+    private ClaimLane resolveClaimLane(String endProductType) {
+        String prefix = extractEpPrefix(endProductType);
+        if (prefix == null) return ClaimLane.ORIGINAL;
+        if (HLR_EP_PREFIXES.contains(prefix)) return ClaimLane.HLR;
+        if (SUPPLEMENTAL_EP_PREFIXES.contains(prefix)) return ClaimLane.SUPPLEMENTAL;
+        if (DEPENDENCY_EP_PREFIXES.contains(prefix)) return ClaimLane.DEPENDENCY;
+        return ClaimLane.ORIGINAL;
+    }
+
+    // ─── Helpers ───
+
+    private String extractEpPrefix(String endProductType) {
+        if (StringUtils.isBlank(endProductType) || endProductType.length() < 3) return null;
+        return endProductType.substring(0, 3);
+    }
+
+    private boolean containsPensionAwardLines(Set<String> awardLineTypes) {
+        if (awardLineTypes == null || awardLineTypes.isEmpty()) return false;
+        return awardLineTypes.stream().anyMatch(PENSION_AWARD_LINE_TYPES::contains);
+    }
+
+    private boolean containsOnlyPensionAwardLines(Set<String> awardLineTypes) {
+        if (awardLineTypes == null || awardLineTypes.isEmpty()) return false;
+        return PENSION_AWARD_LINE_TYPES.containsAll(awardLineTypes);
+    }
+}
+```
+
+---
+
+### 3. The Letter Route Resolver — Maps Fingerprints to Letter Types
+
+```java
+package gov.va.vba.award.fingerprint;
+
+import gov.va.vba.award.fingerprint.ClaimFingerprint.*;
+import org.springframework.stereotype.Component;
+
+/**
+ * Maps ClaimFingerprints to letter generation pipelines.
+ *
+ * LETTER TYPES:
+ * - PFS_ADL:  PFS Award Decision Letter (Pension & Fiduciary Services)
+ * - COMP_RADL: Redesigned Automated Decision Letter (Compensation Services)
+ * - BURIAL_LETTER: Burial-specific letter template
+ * - NRHLR_DECISION: Non-Rating Higher Level Review Decision Letter
+ * - NO_LETTER: Out-of-scope claim types (CA, MOH, CH18, etc.)
+ */
+@Component
+public class LetterRouteResolver {
+
+    public enum LetterRoute {
+        PFS_ADL("PFS Automated Decision Letter"),
+        COMP_RADL("Compensation Redesigned Automated Decision Letter"),
+        BURIAL_LETTER("Burial Compensation Letter"),
+        NRHLR_DECISION("Non-Rating Higher Level Review Decision Letter"),
+        FEE_ALLOCATION_NOTICE("Fee Allocation Notice Letter"),
+        NO_LETTER("No automated letter generated");
+
+        private final String description;
+        LetterRoute(String description) { this.description = description; }
+        public String getDescription() { return description; }
+    }
+
+    /**
+     * Resolves the letter route for a given claim fingerprint.
+     *
+     * ROUTING RULES (ordered by specificity):
+     *
+     * RULE 1: SPECIAL programs → NO_LETTER
+     *   MOH, Clothing Allowance, CH18
+     *
+     * RULE 2: BURIAL → BURIAL_LETTER
+     *
+     * RULE 3: HLR claim lane → NRHLR_DECISION
+     *   (Non-Rating HLR has its own letter regardless of program)
+     *
+     * RULE 4: PENSION program → PFS_ADL
+     *   All pension claims (veteran, spouse, child, parent)
+     *   Section 306, Old Law, Improved Pension
+     *
+     * RULE 5: NON_SERVICE_CONNECTED → PFS_ADL
+     *   Even under CPL, if purely pension = PFS territory
+     *
+     * RULE 6: DIC program → COMP_RADL
+     *   DIC is SC death benefit → typically RADL
+     *   BUT: CPDS/CPDC/CPDP with pension lines → PFS_ADL
+     *
+     * RULE 7: COMPENSATION → COMP_RADL
+     *   Default for SC compensation claims
+     *
+     * RULE 8: MIXED service connection → COMP_RADL
+     *   When both SC and NSC components, Comp claims the letter
+     *   (PFS sections embedded within RADL as needed)
+     *
+     * RULE 9: ACCRUED → route based on underlying program
+     */
+    public LetterRoute resolve(ClaimFingerprint fingerprint) {
+
+        // Rule 1: Special programs — no automated letter
+        if (fingerprint.getProgramType() == ProgramType.SPECIAL) {
+            return LetterRoute.NO_LETTER;
+        }
+
+        // Rule 2: Burial — dedicated template
+        if (fingerprint.getProgramType() == ProgramType.BURIAL) {
+            return LetterRoute.BURIAL_LETTER;
+        }
+
+        // Rule 3: HLR lane — Non-Rating HLR Decision Letter
+        if (fingerprint.getClaimLane() == ClaimLane.HLR) {
+            return LetterRoute.NRHLR_DECISION;
+        }
+
+        // Rule 4: Pension program — always PFS ADL
+        if (fingerprint.getProgramType() == ProgramType.PENSION) {
+            return LetterRoute.PFS_ADL;
+        }
+
+        // Rule 5: Non-service-connected claims — PFS ADL
+        if (fingerprint.getServiceConnection() == ServiceConnection.NON_SERVICE_CONNECTED) {
+            return LetterRoute.PFS_ADL;
+        }
+
+        // Rule 6: DIC — Compensation RADL (service-connected death)
+        if (fingerprint.getProgramType() == ProgramType.DIC) {
+            return LetterRoute.COMP_RADL;
+        }
+
+        // Rule 7: Compensation — RADL
+        if (fingerprint.getProgramType() == ProgramType.COMPENSATION) {
+            return LetterRoute.COMP_RADL;
+        }
+
+        // Rule 8: Mixed service connection — RADL takes primary ownership
+        if (fingerprint.getServiceConnection() == ServiceConnection.MIXED) {
+            return LetterRoute.COMP_RADL;
+        }
+
+        // Rule 9: Accrued — route based on service connection
+        if (fingerprint.getProgramType() == ProgramType.ACCRUED) {
+            if (fingerprint.getServiceConnection() == ServiceConnection.SERVICE_CONNECTED) {
+                return LetterRoute.COMP_RADL;
+            }
+            return LetterRoute.PFS_ADL;
+        }
+
+        // Fallback
+        return LetterRoute.COMP_RADL;
+    }
+
+    /**
+     * Returns metadata about the routing decision for audit/logging.
+     */
+    public LetterRouteDecision resolveWithMetadata(ClaimFingerprint fingerprint) {
+        LetterRoute route = resolve(fingerprint);
+        return new LetterRouteDecision(fingerprint, route);
+    }
+
+    /**
+     * Audit-friendly record of how the routing decision was made.
+     */
+    public static class LetterRouteDecision {
+        private final ClaimFingerprint fingerprint;
+        private final LetterRoute route;
+        private final long resolvedAt;
+
+        LetterRouteDecision(ClaimFingerprint fingerprint, LetterRoute route) {
+            this.fingerprint = fingerprint;
+            this.route = route;
+            this.resolvedAt = System.currentTimeMillis();
+        }
+
+        public ClaimFingerprint getFingerprint() { return fingerprint; }
+        public LetterRoute getRoute() { return route; }
+        public long getResolvedAt() { return resolvedAt; }
+
+        @Override
+        public String toString() {
+            return String.format("LetterRouteDecision[%s -> %s (%s)]",
+                fingerprint.toCanonicalKey(), route.name(), route.getDescription());
+        }
+    }
+}
+```
+
+---
+
+### 4. The Complete Fingerprint-to-Letter Mapping Table
+
+| Fingerprint | Program | Claimant | Benefit | SC? | Fiduciary | Lane | → Letter |
+|---|---|---|---|---|---|---|---|
+| `PENSION:VETERAN:RECURRING:NSC:NO_FID:ORIG` | Pension | Veteran | Recurring | No | No | Original | **PFS ADL** |
+| `PENSION:VETERAN:RECURRING:NSC:FID:ORIG` | Pension | Veteran | Recurring | No | Yes | Original | **PFS ADL** (Fiduciary variant) |
+| `PENSION:SPOUSE:RECURRING:NSC:NO_FID:ORIG` | Death Pension | Spouse | Recurring | No | No | Original | **PFS ADL** |
+| `PENSION:CHILD:RECURRING:NSC:NO_FID:ORIG` | Death Pension | Child | Recurring | No | No | Original | **PFS ADL** |
+| `PENSION:PARENT:RECURRING:NSC:NO_FID:ORIG` | Death Pension | Parent | Recurring | No | No | Original | **PFS ADL** |
+| `COMP:VETERAN:RECURRING:SC:NO_FID:ORIG` | Comp | Veteran | Recurring | Yes | No | Original | **COMP RADL** |
+| `COMP:VETERAN:RECURRING:SC:NO_FID:SUPP` | Comp | Veteran | Recurring | Yes | No | Supplemental | **COMP RADL** |
+| `COMP:VETERAN:RECURRING:SC:FID:ORIG` | Comp | Veteran | Recurring | Yes | Yes | Original | **COMP RADL** (Fiduciary) |
+| `COMP:VETERAN:RECURRING:MIXED:NO_FID:ORIG` | Comp+Pension | Veteran | Recurring | Mixed | No | Original | **COMP RADL** (w/ pension sections) |
+| `DIC:SPOUSE:RECURRING:SC:NO_FID:ORIG` | DIC | Spouse | Recurring | Yes | No | Original | **COMP RADL** |
+| `DIC:CHILD:RECURRING:SC:NO_FID:ORIG` | DIC | Child | Recurring | Yes | No | Original | **COMP RADL** |
+| `DIC:PARENT:RECURRING:SC:NO_FID:ORIG` | DIC | Parent | Recurring | Yes | No | Original | **COMP RADL** |
+| `BURIAL:VETERAN:ONE_TIME:*:*:ORIG` | Burial | Any | One-time | Any | Any | Original | **BURIAL LETTER** |
+| `SPECIAL:VETERAN:*:*:*:*` | MOH/CA/CH18 | Any | Any | Any | Any | Any | **NO LETTER** |
+| `*:*:*:*:*:HLR` | Any | Any | Any | Any | Any | HLR | **NRHLR DECISION** |
+
+---
+
+## How This Replaces Existing Logic
+
+### Before (scattered boolean checks)
+
+```
+AuthorizeAwardLogic → checks isPfsAdlEnabled + isEligibleForPfsAdl boolean
+  ↓
+AwardCompensationLetterConverter → checks isPfsAdlLetter from holder + isPfsAdlEnabled
+  ↓
+RatingInformationDataConsumer → checks awardType ∈ {CPL,CPDS,CPDC,CPDP}
+  ↓
+AwardsDataConsumer → skips validateClaimTypes if isPfsAdlLetter
+  ↓
+displayaward.js → checks !isPfsAdlEnabled || (!isEligibleForPfsAdl && awardType=='CPL') || awardType=='BUR'
+```
+
+### After (centralized fingerprint)
+
+```
+ClaimFingerprintExtractor.extract(awardType, benefitType, epCode, payeeType, awardLines, hasRating)
+  ↓
+LetterRouteResolver.resolve(fingerprint) → PFS_ADL | COMP_RADL | BURIAL | NRHLR | NO_LETTER
+  ↓
+All downstream consumers read the route, not the raw attributes.
+```
+
+### Specific Integration Point
+
+Replace `RatingInformationDataConsumer.getLetterType()`:
+
+```java
+// BEFORE:
+LetterTypeEnum getLetterType(String awardType) {
+    boolean isPfsAdlEnabled = env.isPfsAdlEnabled();
+    if (isPfsAdlEnabled && (AwardType.cplCode.equals(awardType) || ...)) {
+        return LetterTypeEnum.PFS_AUTOMATED_DECISION_LETTER;
+    }
+    return LetterTypeEnum.AUTOMATED_DECISION_LETTER;
+}
+
+// AFTER:
+LetterTypeEnum getLetterType(ClaimFingerprint fingerprint) {
+    LetterRoute route = letterRouteResolver.resolve(fingerprint);
+    switch (route) {
+        case PFS_ADL:         return LetterTypeEnum.PFS_AUTOMATED_DECISION_LETTER;
+        case COMP_RADL:       return LetterTypeEnum.AUTOMATED_DECISION_LETTER;
+        case BURIAL_LETTER:   return LetterTypeEnum.BURIAL_LETTER;
+        case NRHLR_DECISION:  return LetterTypeEnum.NON_RATING_HLR_DECISION_LETTER;
+        default:              return null; // NO_LETTER
+    }
+}
+```
+
+---
+
+## Key Design Decisions & Domain Rationale
+
+### Why CPL Is the "Ambiguous" Award Type
+
+CPL ("Compensation/Pension Live") is used for **both** compensation and pension claims involving a living veteran. The system disambiguates using:
+
+- **EP code prefix**: `150`/`180` = Pension-specific EPs
+- **Benefit type code**: "CP" can mean either
+- **Award line types**: `IP`/`OLP`/`306P` = pension; SC disability lines = compensation
+
+This is why single-attribute routing fails — CPL alone tells you nothing.
+
+### Why CPDS/CPDC/CPDP Span Both Services
+
+These "CPD" (Compensation/Pension Death) types cover **both** DIC (Compensation Service) and Death Pension (PFS). A surviving spouse could receive either:
+
+- **DIC** (38 USC §1310) — if veteran's death was service-connected → **RADL**
+- **Death Pension** (38 USC §1541) — if veteran had wartime service and surviving spouse has low income → **PFS ADL**
+
+The award line types (`DIC`/`DICR`/`DICP` vs. `IDP`/`306DP`) are the differentiator.
+
+### Why Fiduciary Is a Dimension
+
+PFS manages fiduciary appointments. When a fiduciary is involved (payee type ≠ "00"), the letter content changes (different address routing, different legal notices). This is inherent to the claim — a beneficiary either has an appointed fiduciary or doesn't.
+
+---
+
+## Next Steps
+
+1. **Unit tests** for `ClaimFingerprintExtractor` covering every `AwardType` code combination
+2. **Integration into `AuthorizeAwardLogic.confirmLetterOrFinalizeAward()`** to replace the `isEligibleForPfsAdl` boolean chain
+3. **VBMS-Correspondence integration** — pass the `LetterRoute` enum through to `ManifestBuilder_PFS` vs. the existing RADL manifest builder
+4. **Feature flag migration** — `isPfsAdlEnabled` becomes a route-level feature gate rather than a scattered boolean
+5. **Overlap handling** for edge cases (e.g., concurrent comp + pension awards on the same CPL)
