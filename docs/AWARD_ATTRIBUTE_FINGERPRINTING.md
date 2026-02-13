@@ -14,6 +14,13 @@
   - [4. The Complete Fingerprint-to-Letter Mapping Table](#4-the-complete-fingerprint-to-letter-mapping-table)
 - [How This Replaces Existing Logic](#how-this-replaces-existing-logic)
 - [Key Design Decisions & Domain Rationale](#key-design-decisions--domain-rationale)
+- [Dual Entitlement: Comp + Pension Overlap](#dual-entitlement-comp--pension-overlap)
+  - [The Scenario](#the-scenario)
+  - [Problems with the Current Approach](#problems-with-the-current-approach)
+  - [How Fingerprinting Solves This](#how-fingerprinting-solves-this)
+  - [Enhanced Implementation](#enhanced-implementation)
+  - [Complete Comp + Pension Overlap Mapping Table](#complete-comp--pension-overlap-mapping-table)
+  - [Why Booleans Cannot Solve This](#why-booleans-cannot-solve-this)
 - [Next Steps](#next-steps)
 
 ---
@@ -175,6 +182,14 @@ public final class ClaimFingerprint {
         SPECIAL            // COLA, running awards, etc.
     }
 
+    public enum DualEntitlementStatus {
+        NONE,                          // Single-program claim, no overlap
+        COMP_PENSION_ELECTION,         // Veteran has both SC comp and pension eligibility
+        DIC_PENSION_ELECTION,          // Survivor has both DIC and death pension eligibility
+        PENSION_DENIED_COMP_GREATER,   // Applied for pension, comp is greater benefit
+        COMP_DENIED_PENSION_GREATER    // Had comp, pension is now greater benefit
+    }
+
     // ─── Fields ───
 
     private final ProgramType programType;
@@ -183,6 +198,7 @@ public final class ClaimFingerprint {
     private final ServiceConnection serviceConnection;
     private final FiduciaryStatus fiduciaryStatus;
     private final ClaimLane claimLane;
+    private final DualEntitlementStatus dualEntitlement;
 
     private ClaimFingerprint(Builder builder) {
         this.programType = Objects.requireNonNull(builder.programType, "programType is required");
@@ -191,6 +207,7 @@ public final class ClaimFingerprint {
         this.serviceConnection = Objects.requireNonNull(builder.serviceConnection, "serviceConnection is required");
         this.fiduciaryStatus = Objects.requireNonNull(builder.fiduciaryStatus, "fiduciaryStatus is required");
         this.claimLane = Objects.requireNonNull(builder.claimLane, "claimLane is required");
+        this.dualEntitlement = builder.dualEntitlement != null ? builder.dualEntitlement : DualEntitlementStatus.NONE;
     }
 
     // ─── Getters ───
@@ -201,12 +218,13 @@ public final class ClaimFingerprint {
     public ServiceConnection getServiceConnection() { return serviceConnection; }
     public FiduciaryStatus getFiduciaryStatus() { return fiduciaryStatus; }
     public ClaimLane getClaimLane() { return claimLane; }
+    public DualEntitlementStatus getDualEntitlement() { return dualEntitlement; }
 
     // ─── Identity ───
 
     /**
      * Returns a canonical string representation, e.g.:
-     * "PENSION:VETERAN:RECURRING:NON_SERVICE_CONNECTED:NO_FIDUCIARY:ORIGINAL"
+     * "PENSION:VETERAN:RECURRING:NON_SERVICE_CONNECTED:NO_FIDUCIARY:ORIGINAL:NONE"
      */
     public String toCanonicalKey() {
         return String.join(":",
@@ -215,7 +233,8 @@ public final class ClaimFingerprint {
             benefitCategory.name(),
             serviceConnection.name(),
             fiduciaryStatus.name(),
-            claimLane.name()
+            claimLane.name(),
+            dualEntitlement.name()
         );
     }
 
@@ -229,13 +248,14 @@ public final class ClaimFingerprint {
             && benefitCategory == that.benefitCategory
             && serviceConnection == that.serviceConnection
             && fiduciaryStatus == that.fiduciaryStatus
-            && claimLane == that.claimLane;
+            && claimLane == that.claimLane
+            && dualEntitlement == that.dualEntitlement;
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(programType, claimantType, benefitCategory,
-                           serviceConnection, fiduciaryStatus, claimLane);
+                           serviceConnection, fiduciaryStatus, claimLane, dualEntitlement);
     }
 
     @Override
@@ -254,6 +274,7 @@ public final class ClaimFingerprint {
         private ServiceConnection serviceConnection;
         private FiduciaryStatus fiduciaryStatus;
         private ClaimLane claimLane;
+        private DualEntitlementStatus dualEntitlement;
 
         public Builder programType(ProgramType val)             { this.programType = val; return this; }
         public Builder claimantType(ClaimantType val)           { this.claimantType = val; return this; }
@@ -261,6 +282,7 @@ public final class ClaimFingerprint {
         public Builder serviceConnection(ServiceConnection val) { this.serviceConnection = val; return this; }
         public Builder fiduciaryStatus(FiduciaryStatus val)     { this.fiduciaryStatus = val; return this; }
         public Builder claimLane(ClaimLane val)                  { this.claimLane = val; return this; }
+        public Builder dualEntitlement(DualEntitlementStatus val) { this.dualEntitlement = val; return this; }
 
         public ClaimFingerprint build() { return new ClaimFingerprint(this); }
     }
@@ -270,8 +292,6 @@ public final class ClaimFingerprint {
 ---
 
 ### 2. The Fingerprint Extractor — Builds Fingerprints from Existing Data
-
-This is the critical piece that reads from the **existing data structures** in the Awards system and produces a `ClaimFingerprint`.
 
 ```java
 package gov.va.vba.award.fingerprint;
@@ -572,11 +592,34 @@ public class LetterRouteResolver {
         BURIAL_LETTER("Burial Compensation Letter"),
         NRHLR_DECISION("Non-Rating Higher Level Review Decision Letter"),
         FEE_ALLOCATION_NOTICE("Fee Allocation Notice Letter"),
-        NO_LETTER("No automated letter generated");
+        NO_LETTER("No automated letter generated"),
+
+        // ─── Dual Entitlement Composite Routes ───
+        COMP_RADL_WITH_PENSION_DENIAL(
+            "RADL with embedded pension denial — comp is the greater benefit"),
+        PFS_ADL_WITH_COMP_RATING(
+            "PFS ADL with embedded comp rating info — pension is the greater benefit"),
+        COMP_RADL_WITH_ELECTION_NOTICE(
+            "RADL with benefit election notice — Veteran must choose");
 
         private final String description;
         LetterRoute(String description) { this.description = description; }
         public String getDescription() { return description; }
+
+        /** Returns true if this route requires PFS letter content sections */
+        public boolean requiresPfsContent() {
+            return this == PFS_ADL
+                || this == PFS_ADL_WITH_COMP_RATING
+                || this == COMP_RADL_WITH_PENSION_DENIAL;
+        }
+
+        /** Returns true if this route requires Comp/RADL content sections */
+        public boolean requiresCompContent() {
+            return this == COMP_RADL
+                || this == COMP_RADL_WITH_PENSION_DENIAL
+                || this == COMP_RADL_WITH_ELECTION_NOTICE
+                || this == PFS_ADL_WITH_COMP_RATING;
+        }
     }
 
     /**
@@ -585,32 +628,15 @@ public class LetterRouteResolver {
      * ROUTING RULES (ordered by specificity):
      *
      * RULE 1: SPECIAL programs → NO_LETTER
-     *   MOH, Clothing Allowance, CH18
-     *
      * RULE 2: BURIAL → BURIAL_LETTER
-     *
      * RULE 3: HLR claim lane → NRHLR_DECISION
-     *   (Non-Rating HLR has its own letter regardless of program)
-     *
-     * RULE 4: PENSION program → PFS_ADL
-     *   All pension claims (veteran, spouse, child, parent)
-     *   Section 306, Old Law, Improved Pension
-     *
-     * RULE 5: NON_SERVICE_CONNECTED → PFS_ADL
-     *   Even under CPL, if purely pension = PFS territory
-     *
-     * RULE 6: DIC program → COMP_RADL
-     *   DIC is SC death benefit → typically RADL
-     *   BUT: CPDS/CPDC/CPDP with pension lines → PFS_ADL
-     *
-     * RULE 7: COMPENSATION → COMP_RADL
-     *   Default for SC compensation claims
-     *
-     * RULE 8: MIXED service connection → COMP_RADL
-     *   When both SC and NSC components, Comp claims the letter
-     *   (PFS sections embedded within RADL as needed)
-     *
-     * RULE 9: ACCRUED → route based on underlying program
+     * RULE 4: Dual entitlement → composite route (see below)
+     * RULE 5: PENSION program → PFS_ADL
+     * RULE 6: NON_SERVICE_CONNECTED → PFS_ADL
+     * RULE 7: DIC program → COMP_RADL
+     * RULE 8: COMPENSATION → COMP_RADL
+     * RULE 9: MIXED service connection → COMP_RADL
+     * RULE 10: ACCRUED → route based on underlying program
      */
     public LetterRoute resolve(ClaimFingerprint fingerprint) {
 
@@ -629,32 +655,37 @@ public class LetterRouteResolver {
             return LetterRoute.NRHLR_DECISION;
         }
 
-        // Rule 4: Pension program — always PFS ADL
+        // Rule 4: Dual entitlement — composite letter needed
+        if (fingerprint.getDualEntitlement() != DualEntitlementStatus.NONE) {
+            return resolveDualEntitlementRoute(fingerprint);
+        }
+
+        // Rule 5: Pension program — always PFS ADL
         if (fingerprint.getProgramType() == ProgramType.PENSION) {
             return LetterRoute.PFS_ADL;
         }
 
-        // Rule 5: Non-service-connected claims — PFS ADL
+        // Rule 6: Non-service-connected claims — PFS ADL
         if (fingerprint.getServiceConnection() == ServiceConnection.NON_SERVICE_CONNECTED) {
             return LetterRoute.PFS_ADL;
         }
 
-        // Rule 6: DIC — Compensation RADL (service-connected death)
+        // Rule 7: DIC — Compensation RADL (service-connected death)
         if (fingerprint.getProgramType() == ProgramType.DIC) {
             return LetterRoute.COMP_RADL;
         }
 
-        // Rule 7: Compensation — RADL
+        // Rule 8: Compensation — RADL
         if (fingerprint.getProgramType() == ProgramType.COMPENSATION) {
             return LetterRoute.COMP_RADL;
         }
 
-        // Rule 8: Mixed service connection — RADL takes primary ownership
+        // Rule 9: Mixed service connection — RADL takes primary ownership
         if (fingerprint.getServiceConnection() == ServiceConnection.MIXED) {
             return LetterRoute.COMP_RADL;
         }
 
-        // Rule 9: Accrued — route based on service connection
+        // Rule 10: Accrued — route based on service connection
         if (fingerprint.getProgramType() == ProgramType.ACCRUED) {
             if (fingerprint.getServiceConnection() == ServiceConnection.SERVICE_CONNECTED) {
                 return LetterRoute.COMP_RADL;
@@ -664,6 +695,41 @@ public class LetterRouteResolver {
 
         // Fallback
         return LetterRoute.COMP_RADL;
+    }
+
+    /**
+     * Dual entitlement routing.
+     *
+     * SCENARIO A: Comp is the greater benefit
+     *   Primary letter: COMP_RADL
+     *   Embedded PFS content: pension denial, pension rate, election rights
+     *
+     * SCENARIO B: Pension is the greater benefit
+     *   Primary letter: PFS_ADL
+     *   Embedded Comp content: SC rating decisions, combined evaluation
+     *   Right to revert to comp if circumstances change
+     *
+     * SCENARIO C: Election pending
+     *   Primary letter: COMP_RADL (with election notice)
+     *   Veteran must be informed of both rates and asked to elect
+     */
+    private LetterRoute resolveDualEntitlementRoute(ClaimFingerprint fingerprint) {
+        switch (fingerprint.getDualEntitlement()) {
+            case PENSION_DENIED_COMP_GREATER:
+                return LetterRoute.COMP_RADL_WITH_PENSION_DENIAL;
+
+            case COMP_DENIED_PENSION_GREATER:
+                return LetterRoute.PFS_ADL_WITH_COMP_RATING;
+
+            case COMP_PENSION_ELECTION:
+                return LetterRoute.COMP_RADL_WITH_ELECTION_NOTICE;
+
+            case DIC_PENSION_ELECTION:
+                return LetterRoute.COMP_RADL_WITH_PENSION_DENIAL;
+
+            default:
+                return LetterRoute.COMP_RADL;
+        }
     }
 
     /**
@@ -807,10 +873,267 @@ PFS manages fiduciary appointments. When a fiduciary is involved (payee type ≠
 
 ---
 
+## Dual Entitlement: Comp + Pension Overlap
+
+### The Scenario
+
+A Veteran is already receiving **service-connected disability compensation** (e.g., rated at 30%) and files a new claim for **Veterans Pension** (non-service-connected, needs-based). This happens when:
+
+- The Veteran has **wartime service** and is age 65+ or permanently/totally disabled from non-SC conditions
+- The Veteran's **income is low enough** to qualify for pension
+- The Veteran may believe the pension rate is **higher than their current comp rate** (especially if they have high unreimbursed medical expenses that reduce countable income)
+
+Under VA rules (38 USC §5304), a Veteran **cannot receive both compensation and pension simultaneously** — they must elect the greater benefit. This is the "**dual entitlement / election**" scenario.
+
+### Problems with the Current Approach
+
+#### Problem 1: CPL Award Type Is Shared
+
+Both the existing compensation award and the new pension claim live under **`AwardType.cplCode` ("CPL")**. The system can't distinguish them by award type alone.
+
+The current `RatingInformationDataConsumer.getLetterType()` sees "CPL" and returns `PFS_AUTOMATED_DECISION_LETTER` — but this Veteran's award has **both SC compensation AND a pension application**. The letter needs to address:
+- The existing compensation rating decisions (RADL content)
+- The pension eligibility determination (PFS ADL content)
+- The dual entitlement election (unique to this overlap)
+
+A single boolean (`isPfsAdlLetter = true/false`) can't capture this — it's **both**.
+
+#### Problem 2: The `isEligibleForPfsAdl` Boolean Is Binary
+
+The front-end dialog currently offers an either/or choice. When `isEligibleForPfsAdl` is `true` and `awardType == 'CPL'`, the dialog shows the PFS ADL option. But this Veteran also has SC disability ratings that need to appear on the letter. If the user selects PFS ADL, the compensation rating information may be omitted. If they select RADL, the pension decision content may be omitted.
+
+#### Problem 3: Award Lines Contain Both Program Types Simultaneously
+
+In the comp-to-pension scenario, the proposed award event may contain:
+- **Compensation award lines** (SC disability, combined rating of 30%)
+- **Pension award line** (`"IP"` — Improved Pension) if pension is the greater benefit
+- **Or** a pension **denial** if compensation remains greater
+
+The `validateClaimTypes()` method in `AwardsDataConsumer` currently bypasses validation when `isPfsAdlLetter` is true — but that bypass may incorrectly skip validation on the compensation EP codes that are legitimately in scope.
+
+#### Problem 4: Pension Denial on a Comp Award Still Needs PFS Content
+
+Even if pension is **denied** (because compensation is the greater benefit), the letter must explain:
+- Why pension was denied
+- What the pension rate would have been
+- The Veteran's right to elect pension in the future if circumstances change
+
+This is PFS content that belongs on what would otherwise be a Comp RADL.
+
+#### Problem 5: Basic Eligibility Decisions Span Both Services
+
+The `BasicEligibilityDecisionController` filters PFS-specific eligibility decisions (DCCNM, DD, DRM) when PFS ADL is disabled. In the comp+pension scenario, the award may have **both** compensation eligibility decisions (Eligible Beneficiary for comp) **and** pension eligibility decisions (Pension Grant) simultaneously. The current filtering logic doesn't account for this overlap.
+
+### How Fingerprinting Solves This
+
+#### The Key Insight: The `MIXED` Service Connection Value
+
+The fingerprint model already has the escape valve for this exact scenario. When the extractor sees a CPL award with **both** compensation and pension award lines, it resolves to:
+
+```
+COMPENSATION:VETERAN:RECURRING:MIXED:NO_FIDUCIARY:ORIGINAL
+                                ^^^^^
+                          This is the key
+```
+
+The `MIXED` service connection value explicitly represents the dual-program state.
+
+#### The 7th Dimension: `DualEntitlementStatus`
+
+To fully handle the comp+pension overlap, the fingerprint model includes a **7th dimension** — `DualEntitlementStatus` — which classifies the specific flavor of dual entitlement:
+
+| Status | Meaning |
+|---|---|
+| `NONE` | Single-program claim, no overlap |
+| `COMP_PENSION_ELECTION` | Veteran has both SC comp and pension eligibility — election needed |
+| `DIC_PENSION_ELECTION` | Survivor has both DIC and death pension eligibility |
+| `PENSION_DENIED_COMP_GREATER` | Applied for pension, comp is greater benefit |
+| `COMP_DENIED_PENSION_GREATER` | Had comp, pension is now the greater benefit |
+
+### Enhanced Implementation
+
+#### Dual Entitlement Extractor
+
+```java
+/**
+ * DUAL ENTITLEMENT resolution.
+ *
+ * Detects when a Veteran/survivor is eligible for benefits under
+ * both Compensation Service and PFS programs simultaneously.
+ *
+ * Indicators from the data:
+ * - PensionType.dualEntitlement flag on the rating
+ * - PensionType.compensationGreaterBenefit flag
+ * - Presence of both SC rating issues AND pension award lines
+ * - Basic eligibility decisions containing both comp grants and pension grants/denials
+ */
+private DualEntitlementStatus resolveDualEntitlement(
+        String awardType,
+        Set<String> awardLineTypes,
+        boolean hasRatingProfile,
+        Boolean dualEntitlementFlag,
+        Boolean compensationGreaterBenefitFlag,
+        List<String> basicEligibilityDecisionCodes) {
+
+    // Only CPL and death types can have dual entitlement
+    if (!AwardType.cplCode.equals(awardType)
+        && !AwardType.cpdsCode.equals(awardType)) {
+        return DualEntitlementStatus.NONE;
+    }
+
+    // Check the explicit dual entitlement flag from the pension rating
+    if (Boolean.TRUE.equals(dualEntitlementFlag)) {
+        if (Boolean.TRUE.equals(compensationGreaterBenefitFlag)) {
+            return DualEntitlementStatus.PENSION_DENIED_COMP_GREATER;
+        }
+        return DualEntitlementStatus.COMP_DENIED_PENSION_GREATER;
+    }
+
+    // Check for mixed award lines as a secondary indicator
+    boolean hasPensionLines = containsPensionAwardLines(awardLineTypes);
+    boolean hasCompIndicators = hasRatingProfile;
+    if (hasPensionLines && hasCompIndicators) {
+        return DualEntitlementStatus.COMP_PENSION_ELECTION;
+    }
+
+    // Check basic eligibility decisions for pension grant + comp entitlement
+    if (basicEligibilityDecisionCodes != null) {
+        boolean hasPensionGrant = basicEligibilityDecisionCodes.stream()
+            .anyMatch(code -> Arrays.asList("PGVA65", "PGVNH", "PGVDDSS", "EB").contains(code));
+        boolean hasPensionDenial = basicEligibilityDecisionCodes.stream()
+            .anyMatch(code -> Arrays.asList("NESP", "NWB").contains(code));
+        if ((hasPensionGrant || hasPensionDenial) && hasCompIndicators) {
+            if (hasPensionDenial) return DualEntitlementStatus.PENSION_DENIED_COMP_GREATER;
+            return DualEntitlementStatus.COMP_PENSION_ELECTION;
+        }
+    }
+
+    return DualEntitlementStatus.NONE;
+}
+```
+
+#### Enhanced Letter Route Resolver — Dual Entitlement Routing
+
+```java
+/**
+ * Dual entitlement routing.
+ *
+ * SCENARIO A: Comp is the greater benefit
+ *   Primary letter: COMP_RADL
+ *   Embedded PFS content:
+ *     - Pension denial explanation
+ *     - Pension rate that would have applied
+ *     - Right to elect pension in the future
+ *     - Income/expense verification requirements
+ *
+ * SCENARIO B: Pension is the greater benefit
+ *   Primary letter: PFS_ADL
+ *   Embedded Comp content:
+ *     - SC rating decisions (still on record)
+ *     - Combined evaluation percentage
+ *     - Right to revert to comp if circumstances change
+ *
+ * SCENARIO C: Election pending
+ *   Primary letter: COMP_RADL (with election notice)
+ *   The Veteran must be informed of both rates and asked
+ *   to elect the greater benefit.
+ */
+private LetterRoute resolveDualEntitlementRoute(ClaimFingerprint fingerprint) {
+    switch (fingerprint.getDualEntitlement()) {
+        case PENSION_DENIED_COMP_GREATER:
+            // Comp is greater — RADL is primary, but with PFS pension denial sections
+            return LetterRoute.COMP_RADL_WITH_PENSION_DENIAL;
+
+        case COMP_DENIED_PENSION_GREATER:
+            // Pension is greater — PFS ADL is primary, with comp rating info embedded
+            return LetterRoute.PFS_ADL_WITH_COMP_RATING;
+
+        case COMP_PENSION_ELECTION:
+            // Election needed — RADL with election notice
+            return LetterRoute.COMP_RADL_WITH_ELECTION_NOTICE;
+
+        case DIC_PENSION_ELECTION:
+            // Survivor dual entitlement
+            return LetterRoute.COMP_RADL_WITH_PENSION_DENIAL;
+
+        default:
+            return LetterRoute.COMP_RADL;
+    }
+}
+```
+
+#### Enhanced LetterRoute Enum with Content Helpers
+
+```java
+public enum LetterRoute {
+    PFS_ADL("PFS Automated Decision Letter"),
+    COMP_RADL("Compensation Redesigned Automated Decision Letter"),
+    BURIAL_LETTER("Burial Compensation Letter"),
+    NRHLR_DECISION("Non-Rating Higher Level Review Decision Letter"),
+    FEE_ALLOCATION_NOTICE("Fee Allocation Notice Letter"),
+    NO_LETTER("No automated letter generated"),
+
+    // ─── Dual Entitlement Composite Routes ───
+    COMP_RADL_WITH_PENSION_DENIAL(
+        "RADL with embedded pension denial — comp is the greater benefit"),
+    PFS_ADL_WITH_COMP_RATING(
+        "PFS ADL with embedded comp rating info — pension is the greater benefit"),
+    COMP_RADL_WITH_ELECTION_NOTICE(
+        "RADL with benefit election notice — Veteran must choose");
+
+    private final String description;
+    LetterRoute(String description) { this.description = description; }
+    public String getDescription() { return description; }
+
+    /** Returns true if this route requires PFS letter content sections */
+    public boolean requiresPfsContent() {
+        return this == PFS_ADL
+            || this == PFS_ADL_WITH_COMP_RATING
+            || this == COMP_RADL_WITH_PENSION_DENIAL;
+    }
+
+    /** Returns true if this route requires Comp/RADL content sections */
+    public boolean requiresCompContent() {
+        return this == COMP_RADL
+            || this == COMP_RADL_WITH_PENSION_DENIAL
+            || this == COMP_RADL_WITH_ELECTION_NOTICE
+            || this == PFS_ADL_WITH_COMP_RATING;
+    }
+}
+```
+
+### Complete Comp + Pension Overlap Mapping Table
+
+| Scenario | Award Lines | Rating? | Dual Ent. Flag | Fingerprint | → Letter Route |
+|---|---|---|---|---|---|
+| Veteran has comp only, no pension claim | SC lines only | Yes | No | `COMP:VET:REC:SC:NO_FID:ORIG:NONE` | **COMP RADL** |
+| Veteran applies for pension, denied (comp is greater) | SC lines + pension denial | Yes | Yes (comp greater) | `COMP:VET:REC:MIXED:NO_FID:ORIG:PENSION_DENIED_COMP_GREATER` | **COMP RADL + Pension Denial** |
+| Veteran applies for pension, granted (pension is greater) | IP line replaces SC lines | Yes | Yes (pension greater) | `PENSION:VET:REC:MIXED:NO_FID:ORIG:COMP_DENIED_PENSION_GREATER` | **PFS ADL + Comp Rating** |
+| Veteran applies for pension, election pending | SC lines + IP line | Yes | Yes | `COMP:VET:REC:MIXED:NO_FID:ORIG:COMP_PENSION_ELECTION` | **COMP RADL + Election Notice** |
+| Veteran has pension only, no comp history | IP/OLP/306P only | No | No | `PENSION:VET:REC:NSC:NO_FID:ORIG:NONE` | **PFS ADL** |
+
+### Why Booleans Cannot Solve This
+
+The current system has one boolean: `isPfsAdlLetter`. This gives you **two states**:
+- `true` → PFS ADL
+- `false` → RADL
+
+But the comp+pension overlap requires **five distinct states** (the five rows above). The fingerprint approach captures all five because:
+
+1. **`ServiceConnection.MIXED`** detects the overlap condition
+2. **`DualEntitlementStatus`** classifies which flavor of overlap
+3. **`LetterRoute` composite values** tell the template engine exactly what sections to include
+
+The correspondence templates already have the building blocks — PFS decision point populators and RADL templates exist separately. The fingerprint provides the **intelligent orchestration layer** that decides which pieces to assemble for each unique claim state.
+
+---
+
 ## Next Steps
 
 1. **Unit tests** for `ClaimFingerprintExtractor` covering every `AwardType` code combination
-2. **Integration into `AuthorizeAwardLogic.confirmLetterOrFinalizeAward()`** to replace the `isEligibleForPfsAdl` boolean chain
-3. **VBMS-Correspondence integration** — pass the `LetterRoute` enum through to `ManifestBuilder_PFS` vs. the existing RADL manifest builder
-4. **Feature flag migration** — `isPfsAdlEnabled` becomes a route-level feature gate rather than a scattered boolean
-5. **Overlap handling** for edge cases (e.g., concurrent comp + pension awards on the same CPL)
+2. **Unit tests** for `DualEntitlementStatus` resolution covering all comp+pension overlap scenarios
+3. **Integration into `AuthorizeAwardLogic.confirmLetterOrFinalizeAward()`** to replace the `isEligibleForPfsAdl` boolean chain
+4. **VBMS-Correspondence integration** — pass the `LetterRoute` enum through to `ManifestBuilder_PFS` vs. the existing RADL manifest builder
+5. **Feature flag migration** — `isPfsAdlEnabled` becomes a route-level feature gate rather than a scattered boolean
+6. **Composite template assembly** — implement `requiresPfsContent()` and `requiresCompContent()` hooks in the correspondence template engine to support dual entitlement letter routes
+7. **Overlap handling** for additional edge cases (e.g., concurrent comp + pension awards on the same CPL, survivor DIC + death pension elections)
