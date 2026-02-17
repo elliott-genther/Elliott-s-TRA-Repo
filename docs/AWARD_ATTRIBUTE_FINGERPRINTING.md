@@ -771,23 +771,23 @@ public class LetterRouteResolver {
 
 ### 4. The Complete Fingerprint-to-Letter Mapping Table
 
-| Fingerprint | Program | Claimant | Benefit | SC? | Fiduciary | Lane | → Letter |
-|---|---|---|---|---|---|---|---|
-| `PENSION:VETERAN:RECURRING:NSC:NO_FID:ORIG` | Pension | Veteran | Recurring | No | No | Original | **PFS ADL** |
-| `PENSION:VETERAN:RECURRING:NSC:FID:ORIG` | Pension | Veteran | Recurring | No | Yes | Original | **PFS ADL** (Fiduciary variant) |
-| `PENSION:SPOUSE:RECURRING:NSC:NO_FID:ORIG` | Death Pension | Spouse | Recurring | No | No | Original | **PFS ADL** |
-| `PENSION:CHILD:RECURRING:NSC:NO_FID:ORIG` | Death Pension | Child | Recurring | No | No | Original | **PFS ADL** |
-| `PENSION:PARENT:RECURRING:NSC:NO_FID:ORIG` | Death Pension | Parent | Recurring | No | No | Original | **PFS ADL** |
-| `COMP:VETERAN:RECURRING:SC:NO_FID:ORIG` | Comp | Veteran | Recurring | Yes | No | Original | **COMP RADL** |
-| `COMP:VETERAN:RECURRING:SC:NO_FID:SUPP` | Comp | Veteran | Recurring | Yes | No | Supplemental | **COMP RADL** |
-| `COMP:VETERAN:RECURRING:SC:FID:ORIG` | Comp | Veteran | Recurring | Yes | Yes | Original | **COMP RADL** (Fiduciary) |
-| `COMP:VETERAN:RECURRING:MIXED:NO_FID:ORIG` | Comp+Pension | Veteran | Recurring | Mixed | No | Original | **COMP RADL** (w/ pension sections) |
-| `DIC:SPOUSE:RECURRING:SC:NO_FID:ORIG` | DIC | Spouse | Recurring | Yes | No | Original | **COMP RADL** |
-| `DIC:CHILD:RECURRING:SC:NO_FID:ORIG` | DIC | Child | Recurring | Yes | No | Original | **COMP RADL** |
-| `DIC:PARENT:RECURRING:SC:NO_FID:ORIG` | DIC | Parent | Recurring | Yes | No | Original | **COMP RADL** |
-| `BURIAL:VETERAN:ONE_TIME:*:*:ORIG` | Burial | Any | One-time | Any | Any | Original | **BURIAL LETTER** |
-| `SPECIAL:VETERAN:*:*:*:*` | MOH/CA/CH18 | Any | Any | Any | Any | Any | **NO LETTER** |
-| `*:*:*:*:*:HLR` | Any | Any | Any | Any | Any | HLR | **NRHLR DECISION** |
+| Fingerprint | Source Award Types | Program | Claimant | Benefit | SC? | Fiduciary | Lane | → Letter |
+|---|---|---|---|---|---|---|---|---|
+| `PENSION:VETERAN:RECURRING:NSC:NO_FID:ORIG` | `CPL` (w/ pension EP prefixes or pension-only award lines), `306V`, `OLV` | Pension | Veteran | Recurring | No | No | Original | **PFS ADL** |
+| `PENSION:VETERAN:RECURRING:NSC:FID:ORIG` | `CPL` (w/ pension EP prefixes or pension-only award lines), `306V`, `OLV` | Pension | Veteran | Recurring | No | Yes | Original | **PFS ADL** (Fiduciary variant) |
+| `PENSION:SPOUSE:RECURRING:NSC:NO_FID:ORIG` | `CPDS` (w/ IDP/306DP lines), `306S`, `OLS` | Death Pension | Spouse | Recurring | No | No | Original | **PFS ADL** |
+| `PENSION:CHILD:RECURRING:NSC:NO_FID:ORIG` | `CPDC` (w/ IDP/306DP lines), `306C`, `OLC` | Death Pension | Child | Recurring | No | No | Original | **PFS ADL** |
+| `PENSION:PARENT:RECURRING:NSC:NO_FID:ORIG` | `CPDP` (w/ IDP/306DP lines) | Death Pension | Parent | Recurring | No | No | Original | **PFS ADL** |
+| `COMP:VETERAN:RECURRING:SC:NO_FID:ORIG` | `CPL` (w/ comp EP prefixes or comp award lines) | Comp | Veteran | Recurring | Yes | No | Original | **COMP RADL** |
+| `COMP:VETERAN:RECURRING:SC:NO_FID:SUPP` | `CPL` (w/ comp EP prefixes or comp award lines) | Comp | Veteran | Recurring | Yes | No | Supplemental | **COMP RADL** |
+| `COMP:VETERAN:RECURRING:SC:FID:ORIG` | `CPL` (w/ comp EP prefixes or comp award lines) | Comp | Veteran | Recurring | Yes | Yes | Original | **COMP RADL** (Fiduciary) |
+| `COMP:VETERAN:RECURRING:MIXED:NO_FID:ORIG` | `CPL` (w/ both comp and pension lines) | Comp+Pension | Veteran | Recurring | Mixed | No | Original | **COMP RADL** (w/ pension sections) |
+| `DIC:SPOUSE:RECURRING:SC:NO_FID:ORIG` | `CPDS` (w/ DIC/DICR/DICP/DC lines), `DCS`, `1312S` | DIC | Spouse | Recurring | Yes | No | Original | **COMP RADL** |
+| `DIC:CHILD:RECURRING:SC:NO_FID:ORIG` | `CPDC` (w/ DIC/DICR/DICP/DC lines), `DCC`, `1312C` | DIC | Child | Recurring | Yes | No | Original | **COMP RADL** |
+| `DIC:PARENT:RECURRING:SC:NO_FID:ORIG` | `CPDP` (w/ DIC/DICR/DICP/DC lines), `DCP`, `1312P` | DIC | Parent | Recurring | Yes | No | Original | **COMP RADL** |
+| `BURIAL:VETERAN:ONE_TIME:*:*:ORIG` | `BUR` | Burial | Any | One-time | Any | Any | Original | **BURIAL LETTER** |
+| `SPECIAL:VETERAN:*:*:*:*` | `MOH`, `CA`, `CH18` | MOH/CA/CH18 | Any | Any | Any | Any | Any | **NO LETTER** |
+| `*:*:*:*:*:HLR` | Any (HLR lane) | Any | Any | Any | Any | Any | HLR | **NRHLR DECISION** |
 
 ---
 
@@ -870,6 +870,52 @@ The award line types (`DIC`/`DICR`/`DICP` vs. `IDP`/`306DP`) are the differentia
 ### Why Fiduciary Is a Dimension
 
 PFS manages fiduciary appointments. When a fiduciary is involved (payee type ≠ "00"), the letter content changes (different address routing, different legal notices). This is inherent to the claim — a beneficiary either has an appointed fiduciary or doesn't.
+
+### Edge Case: CPDS/CPDC/CPDP with Both DIC and Pension Award Lines
+
+When a CPDS/CPDC/CPDP claim has **both** DIC lines (DIC, DICR, DICP, DC) **and** pension lines (IDP, 306DP, etc.) on the same award, the current extractor resolves to `ProgramType.DIC` because DIC lines are checked first in the `resolveProgramType()` method (lines 472-475 in the proposed implementation).
+
+**Current Behavior:**
+
+```java
+// CPDS/CPDC/CPDP — Death types
+if (AwardType.cpdsCode.equals(awardType)
+    || AwardType.cpdcCode.equals(awardType)
+    || AwardType.cpdpCode.equals(awardType)) {
+    if (awardLineTypes != null
+        && (awardLineTypes.contains("DIC") || awardLineTypes.contains("DICR")
+            || awardLineTypes.contains("DICP") || awardLineTypes.contains("DC"))) {
+        return ProgramType.DIC;  // ← DIC checked first
+    }
+    if (containsPensionAwardLines(awardLineTypes)) {
+        return ProgramType.PENSION;  // ← Pension checked second
+    }
+    return ProgramType.DIC;  // ← Default to DIC if no lines match
+}
+```
+
+**Implications:**
+
+- The pension lines are **silently ignored** for routing purposes when DIC lines are present
+- The claim routes to **COMP RADL**, not PFS ADL
+- This is a deliberate precedence decision: **DIC (service-connected death) takes priority over Death Pension (non-service-connected)**
+
+**Business Rationale:**
+
+DIC is a higher-value, service-connected benefit that is mutually exclusive with Death Pension under 38 USC §5304(a)(1). When both types of award lines appear on the same CPDS/CPDC/CPDP claim, it typically represents one of these scenarios:
+
+1. **Award conversion**: A beneficiary previously receiving Death Pension is now being granted DIC retroactively (e.g., due to a new service-connection determination for the veteran's cause of death)
+2. **Dual claim adjudication**: Both DIC and Death Pension were evaluated, and DIC was granted (making the pension lines moot)
+3. **Historical remnants**: Legacy data where both line types exist due to system migrations or corrections
+
+In all cases, routing to COMP RADL (via `ProgramType.DIC`) is the correct behavior because:
+- DIC requires rating-related content (service connection determinations, dependency status)
+- The Compensation Service handles DIC claims, not PFS
+- If pension was denied in favor of DIC, that decision needs to be explained in RADL content
+
+**Open Question:**
+
+Should this instead resolve to `ProgramType.MIXED` (like the CPL dual entitlement case) or generate two separate letters? This is flagged for further analysis in **Next Steps #6** (overlap handling). The current implementation prioritizes DIC routing as the safer default, ensuring service-connected death benefits receive appropriate rating content.
 
 ---
 
